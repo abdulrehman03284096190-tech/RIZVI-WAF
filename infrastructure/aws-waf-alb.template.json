@@ -1,0 +1,360 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Production AWS WAFv2 protection and redacted CloudWatch logging for an existing regional Application Load Balancer.",
+  "Parameters": {
+    "ApplicationLoadBalancerArn": {
+      "Type": "String",
+      "Description": "ARN of the existing ALB to protect. Deploy this stack in the same AWS Region.",
+      "AllowedPattern": "^arn:[^:]+:elasticloadbalancing:[^:]+:[0-9]{12}:loadbalancer/app/[A-Za-z0-9-]+/[A-Fa-f0-9]+$",
+      "ConstraintDescription": "Provide an Application Load Balancer ARN (not a Network Load Balancer ARN)."
+    },
+    "RateLimit": {
+      "Type": "Number",
+      "Default": 2000,
+      "MinValue": 100,
+      "MaxValue": 2000000000,
+      "Description": "Maximum requests per source IP in the AWS WAF five-minute evaluation window. Tune against measured production traffic."
+    },
+    "ManagedRuleActionMode": {
+      "Type": "String",
+      "Default": "BLOCK",
+      "AllowedValues": [
+        "BLOCK",
+        "COUNT"
+      ],
+      "Description": "Use COUNT on staging to measure managed-rule false positives before deploying BLOCK in production."
+    },
+    "LogRetentionDays": {
+      "Type": "Number",
+      "Default": 30,
+      "AllowedValues": [
+        7,
+        14,
+        30,
+        60,
+        90,
+        120,
+        150,
+        180,
+        365,
+        400,
+        545,
+        731,
+        1096,
+        1827,
+        2192,
+        2557,
+        2922,
+        3288,
+        3653
+      ],
+      "Description": "CloudWatch Logs retention in days."
+    },
+    "LogKmsKeyArn": {
+      "Type": "String",
+      "Default": "",
+      "Description": "Optional customer-managed KMS key ARN in this Region for WAF log encryption."
+    },
+    "MetricPrefix": {
+      "Type": "String",
+      "Default": "RizviWAF",
+      "MinLength": 1,
+      "MaxLength": 60,
+      "AllowedPattern": "^[A-Za-z0-9_-]+$",
+      "Description": "Prefix for AWS WAF CloudWatch metric names."
+    }
+  },
+  "Conditions": {
+    "CountManagedRules": {
+      "Fn::Equals": [
+        {
+          "Ref": "ManagedRuleActionMode"
+        },
+        "COUNT"
+      ]
+    },
+    "UseCustomerManagedLogKey": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "LogKmsKeyArn"
+            },
+            ""
+          ]
+        }
+      ]
+    }
+  },
+  "Resources": {
+    "WafLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "aws-waf-logs-${AWS::StackName}"
+        },
+        "RetentionInDays": {
+          "Ref": "LogRetentionDays"
+        },
+        "KmsKeyId": {
+          "Fn::If": [
+            "UseCustomerManagedLogKey",
+            {
+              "Ref": "LogKmsKeyArn"
+            },
+            {
+              "Ref": "AWS::NoValue"
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "ManagedBy",
+            "Value": "RIZVI-WAF-CloudFormation"
+          }
+        ]
+      }
+    },
+    "ProductionWebACL": {
+      "Type": "AWS::WAFv2::WebACL",
+      "Properties": {
+        "Description": "AWS managed production protections for the RIZVI application ALB.",
+        "Scope": "REGIONAL",
+        "DefaultAction": {
+          "Allow": {}
+        },
+        "VisibilityConfig": {
+          "CloudWatchMetricsEnabled": true,
+          "MetricName": {
+            "Fn::Sub": "${MetricPrefix}-WebACL"
+          },
+          "SampledRequestsEnabled": false
+        },
+        "Rules": [
+          {
+            "Name": "AmazonIpReputation",
+            "Priority": 0,
+            "Statement": {
+              "ManagedRuleGroupStatement": {
+                "VendorName": "AWS",
+                "Name": "AWSManagedRulesAmazonIpReputationList"
+              }
+            },
+            "OverrideAction": {
+              "Fn::If": [
+                "CountManagedRules",
+                {
+                  "Count": {}
+                },
+                {
+                  "None": {}
+                }
+              ]
+            },
+            "VisibilityConfig": {
+              "CloudWatchMetricsEnabled": true,
+              "MetricName": {
+                "Fn::Sub": "${MetricPrefix}-IpReputation"
+              },
+              "SampledRequestsEnabled": false
+            }
+          },
+          {
+            "Name": "CommonRuleSet",
+            "Priority": 10,
+            "Statement": {
+              "ManagedRuleGroupStatement": {
+                "VendorName": "AWS",
+                "Name": "AWSManagedRulesCommonRuleSet"
+              }
+            },
+            "OverrideAction": {
+              "Fn::If": [
+                "CountManagedRules",
+                {
+                  "Count": {}
+                },
+                {
+                  "None": {}
+                }
+              ]
+            },
+            "VisibilityConfig": {
+              "CloudWatchMetricsEnabled": true,
+              "MetricName": {
+                "Fn::Sub": "${MetricPrefix}-CommonRules"
+              },
+              "SampledRequestsEnabled": false
+            }
+          },
+          {
+            "Name": "KnownBadInputs",
+            "Priority": 20,
+            "Statement": {
+              "ManagedRuleGroupStatement": {
+                "VendorName": "AWS",
+                "Name": "AWSManagedRulesKnownBadInputsRuleSet"
+              }
+            },
+            "OverrideAction": {
+              "Fn::If": [
+                "CountManagedRules",
+                {
+                  "Count": {}
+                },
+                {
+                  "None": {}
+                }
+              ]
+            },
+            "VisibilityConfig": {
+              "CloudWatchMetricsEnabled": true,
+              "MetricName": {
+                "Fn::Sub": "${MetricPrefix}-KnownBadInputs"
+              },
+              "SampledRequestsEnabled": false
+            }
+          },
+          {
+            "Name": "SQLiRuleSet",
+            "Priority": 30,
+            "Statement": {
+              "ManagedRuleGroupStatement": {
+                "VendorName": "AWS",
+                "Name": "AWSManagedRulesSQLiRuleSet"
+              }
+            },
+            "OverrideAction": {
+              "Fn::If": [
+                "CountManagedRules",
+                {
+                  "Count": {}
+                },
+                {
+                  "None": {}
+                }
+              ]
+            },
+            "VisibilityConfig": {
+              "CloudWatchMetricsEnabled": true,
+              "MetricName": {
+                "Fn::Sub": "${MetricPrefix}-SQLi"
+              },
+              "SampledRequestsEnabled": false
+            }
+          },
+          {
+            "Name": "PerIpRateLimit",
+            "Priority": 40,
+            "Statement": {
+              "RateBasedStatement": {
+                "Limit": {
+                  "Ref": "RateLimit"
+                },
+                "AggregateKeyType": "IP",
+                "EvaluationWindowSec": 300
+              }
+            },
+            "Action": {
+              "Fn::If": [
+                "CountManagedRules",
+                {
+                  "Count": {}
+                },
+                {
+                  "Block": {}
+                }
+              ]
+            },
+            "VisibilityConfig": {
+              "CloudWatchMetricsEnabled": true,
+              "MetricName": {
+                "Fn::Sub": "${MetricPrefix}-RateLimit"
+              },
+              "SampledRequestsEnabled": false
+            }
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "ManagedBy",
+            "Value": "RIZVI-WAF-CloudFormation"
+          }
+        ]
+      }
+    },
+    "ProductionWebACLLogging": {
+      "Type": "AWS::WAFv2::LoggingConfiguration",
+      "Properties": {
+        "ResourceArn": {
+          "Fn::GetAtt": [
+            "ProductionWebACL",
+            "Arn"
+          ]
+        },
+        "LogDestinationConfigs": [
+          {
+            "Fn::GetAtt": [
+              "WafLogGroup",
+              "Arn"
+            ]
+          }
+        ],
+        "RedactedFields": [
+          {
+            "SingleHeader": {
+              "Name": "authorization"
+            }
+          },
+          {
+            "SingleHeader": {
+              "Name": "cookie"
+            }
+          },
+          {
+            "QueryString": {}
+          }
+        ]
+      }
+    },
+    "ProtectApplicationLoadBalancer": {
+      "Type": "AWS::WAFv2::WebACLAssociation",
+      "Properties": {
+        "ResourceArn": {
+          "Ref": "ApplicationLoadBalancerArn"
+        },
+        "WebACLArn": {
+          "Fn::GetAtt": [
+            "ProductionWebACL",
+            "Arn"
+          ]
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "WebACLArn": {
+      "Description": "ARN of the regional AWS WAF Web ACL associated with the ALB.",
+      "Value": {
+        "Fn::GetAtt": [
+          "ProductionWebACL",
+          "Arn"
+        ]
+      }
+    },
+    "WafLogGroupName": {
+      "Description": "CloudWatch Logs group receiving redacted AWS WAF traffic logs.",
+      "Value": {
+        "Ref": "WafLogGroup"
+      }
+    },
+    "ProtectedLoadBalancerArn": {
+      "Description": "Application Load Balancer associated with the Web ACL.",
+      "Value": {
+        "Ref": "ApplicationLoadBalancerArn"
+      }
+    }
+  }
+}
